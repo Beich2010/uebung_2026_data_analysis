@@ -10,48 +10,314 @@ import numpy as np
 import pandas as pd
 
 
-def plot_forecasts_for_day(models_dict, day):
+def plot_forecasts_for_day(
+    models_dict,
+    day,
+    y=None,
+    X_full=None,
+    X_target_full=None,
+    X_cyclic_full=None,
+    X_scaled_full=None,
+    context_hours=48,
+):
     """
-    Plot forecasts for a given day, using the native timestamp index from y_test.
+    Plot forecasts for a given day with optional context window, y overlay,
+    hour encodings, and holiday encodings.
+
+    Panels (top → bottom)
+    ---------------------
+    0        : Forecast + context + y overlay (always shown)
+    1        : y (true load series over context+forecast) — if y provided
+    --- Hour encodings (if X_full provided) ---
+    n+0      : Raw hour_of_day [0–23]
+    n+1      : Target  hour_dow_target          — if X_target_full provided
+    n+2      : Cyclic  hour_sin / hour_cos       — if X_cyclic_full provided
+    n+3      : Scaled  hour [0–1]               — if X_scaled_full provided
+    --- Holiday encodings (if X_full + X_target_full provided) ---
+    n+4      : One-Hot  holiday flag (binary)
+    n+5      : Target   hour_holiday_target vs. hour_dow_target
 
     Args:
-        models_dict (dict): Keys are model names, values are DataFrames with 'y_pred' and 'y_test'.
-        day (int): Day index (1-based).
+        models_dict (dict):  model name → DataFrame with 'y_pred', 'y_test'.
+        day (int):           Day index (1-based).
+        y (pd.Series|None):  Full ground-truth series (DatetimeIndex) for
+                             context window ground truth + optional overlay.
+        X_full (pd.DataFrame|None):        Must contain "hour_of_day", "holiday".
+        X_target_full (pd.DataFrame|None): Must contain "hour_dow_target",
+                                           "hour_holiday_target".
+        X_cyclic_full (pd.DataFrame|None): Must contain "hour_sin", "hour_cos".
+        X_scaled_full (pd.DataFrame|None): Must contain a column with "hour".
+        context_hours (int): Hours of context before the forecast window.
     """
-    first_df = next(iter(models_dict.values()))
-    y_true = first_df.iloc[day - 1]["y_test"]
+    from encoding_visualizations import _encoding_style, _encoding_rcparams
 
-    x = y_true.index
-    y_true = np.array(y_true)
+    # ── Colors ────────────────────────────────────────────────────────────────
+    teal           = "#4f98a3"
+    gold           = "#e8af34"
+    purple         = "#a86fdf"
+    orange         = "#ffbd67"
+    holiday_orange = "#fda500"
+    red            = "#dd6974"
+    green          = "#6daa45"
+    muted          = "#5a5957"
+    bg             = "#FFFFFF"
 
-    plt.figure(figsize=(12, 5))
-    plt.plot(x, y_true, label="y (True)", linewidth=2)
+    # ── Forecast data ─────────────────────────────────────────────────────────
+    first_df   = next(iter(models_dict.values()))
+    row        = first_df.iloc[day - 1]
+    y_true     = row["y_test"]
+    x          = y_true.index          # 24 forecast timestamps
+    y_true_arr = np.array(y_true)
 
-    for label, df in models_dict.items():
-        y_pred = df.iloc[day - 1]["y_pred"]
-        if hasattr(y_pred, "index"):
-            y_pred = np.array(y_pred)
-        plt.plot(x, y_pred, label=label, linestyle="--")
+    # ── Context index ─────────────────────────────────────────────────────────
+    show_context   = context_hours > 0
+    show_encodings = X_full is not None
+    show_y_panel   = y is not None
 
-    plt.title(f"Forecast Comparison – {x[0].date()}")
-    plt.xlabel("Timestamp")
-    plt.ylabel("Value")
-    plt.xticks(rotation=45)
-    plt.grid(True)
-    plt.legend()
+    ctx_start = x[0] - pd.Timedelta(hours=context_hours)
+
+    if show_context and y is not None:
+        ctx_y   = y[(y.index >= ctx_start) & (y.index < x[0])]
+        ctx_idx = ctx_y.index
+    elif show_context and X_full is not None:
+        ctx_idx = X_full.index[(X_full.index >= ctx_start) & (X_full.index < x[0])]
+        ctx_y   = None
+    else:
+        ctx_idx = pd.DatetimeIndex([])
+        ctx_y   = None
+
+    enc_idx = ctx_idx.append(x) if len(ctx_idx) else x
+
+    # ── Panel count ───────────────────────────────────────────────────────────
+    show_hour_raw    = show_encodings
+    show_hour_target = show_encodings and X_target_full is not None
+    show_hour_cyclic = show_encodings and X_cyclic_full is not None
+    show_hour_scaled = show_encodings and X_scaled_full is not None
+    show_hol_onehot  = show_encodings and "holiday" in X_full.columns
+    show_hol_target  = show_encodings and X_target_full is not None and \
+                       "hour_holiday_target" in X_target_full.columns
+
+    n_enc = sum([show_hour_raw, show_hour_target, show_hour_cyclic,
+                 show_hour_scaled, show_hol_onehot, show_hol_target])
+    n_rows  = 1 + (1 if show_y_panel else 0) + n_enc
+    heights = [3] + ([1] if show_y_panel else []) + [1] * n_enc
+
+    _encoding_rcparams()
+
+    fig, axes = plt.subplots(
+        n_rows, 1,
+        figsize=(14, 3 + 1.6 * max(n_enc + (1 if show_y_panel else 0), 1)),
+        sharex=True,
+        gridspec_kw={
+            "height_ratios": heights,
+            "hspace":        0.12,
+            "top":           0.94,
+            "bottom":        0.08,
+        },
+    )
+    if n_rows == 1:
+        axes = [axes]
+    fig.patch.set_facecolor(bg)
+
+    ax_fc    = axes[0]
+    ax_iter  = iter(axes[1:])
+
+    # ── Holiday axvspan across all panels ─────────────────────────────────────
+    if show_hol_onehot:
+        is_hol_fc = X_full.loc[x, "holiday"].values.astype(bool)
+        if is_hol_fc.any():
+            for ax in axes:
+                ax.axvspan(x[0], x[-1],
+                           color=holiday_orange, alpha=0.06, zorder=0)
+        if show_context and len(ctx_idx):
+            ctx_hol = X_full.loc[ctx_idx, "holiday"].values.astype(bool)
+            for i, ts in enumerate(ctx_idx):
+                if ctx_hol[i]:
+                    for ax in axes:
+                        ax.axvspan(ts, ts + pd.Timedelta(hours=1),
+                                   color=holiday_orange, alpha=0.06, zorder=0)
+
+    # ── Panel 0: Forecast ─────────────────────────────────────────────────────
+    # context ground truth
+    if show_context and ctx_y is not None and len(ctx_y):
+        ax_fc.plot(ctx_y.index, np.array(ctx_y),
+                   color=muted, lw=1.0, alpha=0.5, label="context (true)")
+    elif show_context and ctx_y is None and y is not None:
+        pass  # already handled above
+
+    if show_context and len(ctx_idx):
+        ax_fc.axvline(x[0], color="#d4d1ca", lw=1.0, ls="--", alpha=0.8)
+
+    ax_fc.plot(x, y_true_arr, label="y (True)", lw=2.0, color="#28251d")
+    for lbl, df in models_dict.items():
+        yp = df.iloc[day - 1]["y_pred"]
+        if hasattr(yp, "index"):
+            yp = np.array(yp)
+        ax_fc.plot(x, yp, label=lbl, ls="--", lw=1.1)
+
+    # holiday label
+    if show_hol_onehot and X_full.loc[x, "holiday"].values.astype(bool).any():
+        ax_fc.set_title(
+            f"Forecast Comparison – {x[0].date()}  🗓 Holiday",
+            fontsize=11, fontweight="bold", color="#28251d", loc="left",
+        )
+    else:
+        ax_fc.set_title(
+            f"Forecast Comparison – {x[0].date()}",
+            fontsize=11, fontweight="bold", color="#28251d", loc="left",
+        )
+
+    ax_fc.set_ylabel("Value", fontsize=8, color="#797876")
+    ax_fc.grid(True, axis="y", alpha=0.4)
+    ax_fc.spines[["top", "right"]].set_visible(False)
+    ax_fc.legend(fontsize=7, framealpha=0.0, ncol=2)
+
+    # ── Panel y (full series) ─────────────────────────────────────────────────
+    if show_y_panel:
+        ax = next(ax_iter)
+        y_enc = y[y.index.isin(enc_idx)] if y is not None else None
+        if y_enc is not None and len(y_enc):
+            ax.plot(y_enc.index, np.array(y_enc),
+                    color=muted, lw=0.9, alpha=0.85)
+            ax.fill_between(y_enc.index, np.array(y_enc),
+                            alpha=0.10, color=muted)
+        if show_context and len(ctx_idx):
+            ax.axvline(x[0], color="#d4d1ca", lw=1.0, ls="--", alpha=0.8)
+        _encoding_style(ax, "y  (true load)", muted, ylabel="load")
+
+    # ── Hour encoding panels ──────────────────────────────────────────────────
+    def _vline(ax):
+        if show_context and len(ctx_idx):
+            ax.axvline(x[0], color="#d4d1ca", lw=1.0, ls="--", alpha=0.8)
+
+    if show_hour_raw:
+        ax = next(ax_iter)
+        hv = X_full.loc[enc_idx, "hour_of_day"].values.astype(float)
+        ax.step(enc_idx, hv, color=green, lw=0.9, where="post")
+        ax.fill_between(enc_idx, hv, step="post", color=green, alpha=0.12)
+        ax.set_ylim(-0.5, 24)
+        ax.set_yticks([0, 6, 12, 18, 23])
+        _vline(ax)
+        _encoding_style(ax, "Raw  (hour_of_day)", green, ylabel="hour [0–23]")
+
+    if show_hour_target:
+        ax = next(ax_iter)
+        ax.plot(enc_idx, X_target_full.loc[enc_idx, "hour_dow_target"],
+                color=gold, lw=0.9)
+        ax.fill_between(enc_idx, X_target_full.loc[enc_idx, "hour_dow_target"],
+                        alpha=0.10, color=gold)
+        _vline(ax)
+        _encoding_style(ax, "Target  (hour_dow)", gold, ylabel="target")
+
+    if show_hour_cyclic:
+        ax = next(ax_iter)
+        ax.plot(enc_idx, X_cyclic_full.loc[enc_idx, "hour_sin"],
+                color=purple, lw=0.9, label="sin")
+        ax.plot(enc_idx, X_cyclic_full.loc[enc_idx, "hour_cos"],
+                color=teal, lw=0.9, label="cos", ls="--", alpha=0.75)
+        ax.axhline(0, color=muted, lw=0.4, alpha=0.5)
+        ax.set_ylim(-1.25, 1.25)
+        ax.set_yticks([-1, 0, 1])
+        ax.legend(fontsize=7, loc="upper right", framealpha=0.0, edgecolor="none")
+        _vline(ax)
+        _encoding_style(ax, "Cyclic  (hour)", purple, ylabel="sin/cos")
+
+    if show_hour_scaled:
+        ax = next(ax_iter)
+        col = next((c for c in X_scaled_full.columns
+                    if "hour" in c and c != "holiday"), None)
+        if col:
+            ax.plot(enc_idx, X_scaled_full.loc[enc_idx, col],
+                    color=orange, lw=0.9)
+            ax.fill_between(enc_idx, X_scaled_full.loc[enc_idx, col],
+                            alpha=0.15, color=orange)
+            ax.set_yticks([0, 0.5, 1])
+            _vline(ax)
+            _encoding_style(ax, f"Scaled  ({col})", orange, ylabel="[0–1]")
+
+    # ── Holiday encoding panels ───────────────────────────────────────────────
+    if show_hol_onehot:
+        ax = next(ax_iter)
+        hf = X_full.loc[enc_idx, "holiday"].values.astype(float)
+        ax.fill_between(enc_idx, hf, step="post", color=holiday_orange, alpha=0.45)
+        ax.step(enc_idx, hf, color=holiday_orange, lw=1.2, where="post")
+        ax.set_ylim(-0.15, 1.4)
+        ax.set_yticks([0, 1])
+        ax.set_yticklabels(["0", "1"], fontsize=8)
+        _vline(ax)
+        _encoding_style(ax, "One-Hot  (holiday)", holiday_orange, ylabel="holiday")
+
+    if show_hol_target:
+        ax = next(ax_iter)
+        dow = X_target_full.loc[enc_idx, "hour_dow_target"]
+        hol = X_target_full.loc[enc_idx, "hour_holiday_target"]
+        ax.plot(enc_idx, dow, color=gold, lw=0.9,
+                label="hour_dow_target", alpha=0.9)
+        ax.plot(enc_idx, hol, color=red,  lw=0.9,
+                label="hour_holiday_target", ls="--", alpha=0.85)
+        ax.fill_between(enc_idx, dow, hol, where=(hol > dow),
+                        alpha=0.18, color=red,  label="holiday > dow")
+        ax.fill_between(enc_idx, dow, hol, where=(hol < dow),
+                        alpha=0.18, color=gold, label="holiday < dow")
+        hol_idx = enc_idx[X_full.loc[enc_idx, "holiday"] == 1]
+        for hd in hol_idx[::24]:
+            ax.axvspan(hd, hd + pd.Timedelta(hours=23),
+                       color=holiday_orange, alpha=0.07, zorder=0)
+        ax.legend(fontsize=7, loc="upper right",
+                  framealpha=0.0, edgecolor="none", ncol=2)
+        _vline(ax)
+        _encoding_style(ax, "Target  (holiday vs. dow)", gold, ylabel="target")
+
+    # ── x-axis ────────────────────────────────────────────────────────────────
+    axes[-1].spines["bottom"].set_visible(True)
+    axes[-1].spines["bottom"].set_color("#d4d1ca")
+    axes[-1].tick_params(axis="x", length=3)
+    axes[-1].set_xlabel("Timestamp", fontsize=9, color="#797876")
+    plt.setp(axes[-1].get_xticklabels(), rotation=45, ha="right", fontsize=8)
+
     plt.tight_layout()
     plt.show()
 
-def interactive_forecast_plot(models_dict):
+
+def interactive_forecast_plot(
+    models_dict,
+    y=None,
+    X_full=None,
+    X_target_full=None,
+    X_cyclic_full=None,
+    X_scaled_full=None,
+    context_hours=48,
+):
     """
-    Interactive slider to browse forecast plots per day using existing timestamped y_test.
+    Interactive slider to browse forecast plots per day.
+
+    Usage (minimal):
+        interactive_forecast_plot(models_dict)
+
+    Usage (full):
+        interactive_forecast_plot(
+            models_dict,
+            y=y_series,             # pd.Series with full DatetimeIndex
+            X_full=X_full,          # must contain "hour_of_day", "holiday"
+            X_target_full=X_target_full,
+            X_cyclic_full=X_cyclic_full,
+            X_scaled_full=X_scaled_full,
+            context_hours=48,
+        )
     """
     num_days = len(next(iter(models_dict.values())))
 
     interact(
         plot_forecasts_for_day,
         models_dict=fixed(models_dict),
-        day=IntSlider(min=1, max=num_days, step=1, value=1, description="Day")
+        day=IntSlider(min=1, max=num_days, step=1, value=1, description="Day"),
+        y=fixed(y),
+        X_full=fixed(X_full),
+        X_target_full=fixed(X_target_full),
+        X_cyclic_full=fixed(X_cyclic_full),
+        X_scaled_full=fixed(X_scaled_full),
+        context_hours=IntSlider(min=0, max=168, step=24, value=context_hours,
+                                description="Context h"),
     )
 #
 #
@@ -192,7 +458,7 @@ def evaluate_chronos2_native(y, X_covariates, cv, pipeline, prediction_length, u
         })
 
         # get the last 16 weeks of the training data as context and the next 24 hours as future for prediction
-        context_df = context_df.iloc[-(24 * 7 * 4 * 4):]  
+        context_df = context_df.iloc[-(24 * 7 * 4 * 4 * 2):]  
         future_df = future_df.iloc[:prediction_length] 
 
         if use_covariates:  
