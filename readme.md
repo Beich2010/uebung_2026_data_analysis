@@ -7,7 +7,7 @@ ___
 
 Welcome to the exercise notebook for the Data Analysis Lecture of 2026. This repository contains all the materials and notebooks you will need to follow along with the course exercises.
 
-This 2026 edition adds **Chronos 2** — a pre-trained foundation model for time series forecasting from Amazon Science — alongside the existing N-HiTS and Naive baselines, via the [sktime](https://www.sktime.net/) `Chronos2Forecaster` interface.
+This 2026 edition adds **Chronos 2** — a pre-trained foundation model for time series forecasting from Amazon Science — alongside the existing N-HiTS and Naive baselines.
 
 ## Opening the Notebook
 
@@ -63,7 +63,7 @@ To install and run the notebook locally, follow these steps:
 
 ## Notes
 
-- Ensure that you have Python 3.10 or higher installed on your local machine.
+- Ensure that you have Python 3.11 or higher installed on your local machine.
 - If you encounter any issues or have questions, please refer to the course resources or contact the course instructor.
 
 Happy analyzing!
