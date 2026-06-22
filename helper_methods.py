@@ -287,22 +287,9 @@ def plot_forecasts_for_day(
 
     if show_hol_target:
         ax = next(ax_iter)
-        dow = X_target_full.loc[enc_idx, "hour_dow_target"]
         hol = X_target_full.loc[enc_idx, "hour_holiday_target"]
-        ax.plot(enc_idx, dow, color=gold, lw=0.9,
-                label="hour_dow_target", alpha=0.9)
         ax.plot(enc_idx, hol, color=red,  lw=0.9,
                 label="hour_holiday_target", ls="--", alpha=0.85)
-        ax.fill_between(enc_idx, dow, hol, where=(hol > dow),
-                        alpha=0.18, color=red,  label="holiday > dow")
-        ax.fill_between(enc_idx, dow, hol, where=(hol < dow),
-                        alpha=0.18, color=gold, label="holiday < dow")
-        hol_idx = enc_idx[X_full.loc[enc_idx, "holiday"] == 1]
-        for hd in hol_idx[::24]:
-            ax.axvspan(hd, hd + pd.Timedelta(hours=23),
-                       color=holiday_orange, alpha=0.07, zorder=0)
-        ax.legend(fontsize=7, loc="upper right",
-                  framealpha=0.0, edgecolor="none", ncol=2)
         _vline(ax)
         _encoding_style(ax, "Target  (holiday vs. dow)", gold, ylabel="target")
 
@@ -1091,7 +1078,6 @@ def plot_hour_encodings_over_time(
     return fig
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 def plot_holiday_encodings_over_time(
     X_onehot_full,
     X_target_full,
@@ -1101,35 +1087,6 @@ def plot_holiday_encodings_over_time(
     sample_days: int = 14,
     figsize=(16, 8),
 ):
-    """
-    Three panels over time — all holiday-relevant encodings stacked vertically,
-    synchronized x-axis.
-
-    Panels
-    ------
-    0 : One-Hot  — binary holiday flag (fill + step)
-    1 : Target   — hour_holiday_target vs. hour_dow_target with delta fill;
-                   holiday days highlighted via axvspan
-    2 : Scaled   — holiday flag [0–1]
-
-    Parameters
-    ----------
-    X_onehot_full : pd.DataFrame
-        One-hot encoded hour columns (unused here, kept for API symmetry).
-    X_target_full : pd.DataFrame
-        Must contain "hour_dow_target" and "hour_holiday_target".
-    X_cyclic_full : pd.DataFrame
-        Unused, kept for API symmetry.
-    X_scaled_full : pd.DataFrame
-        Must contain "holiday".
-    X_full : pd.DataFrame
-        Must contain "holiday" (0/1).
-    sample_days : int
-        Number of days to display from the start of the index.
-    figsize : tuple
-        Figure size passed to plt.subplots.
-    """
-
     teal           = "#4f98a3"
     gold           = "#e8af34"
     orange         = "#ffbd67"
@@ -1158,17 +1115,11 @@ def plot_holiday_encodings_over_time(
     ax.set_yticklabels(["0", "1"], fontsize=8)
     _encoding_style(ax, "One-Hot  (holiday flag)", holiday_orange, ylabel="holiday")
 
-    # ── Panel 1: Target — holiday vs. dow ─────────────────────────────────────
+    # ── Panel 1: Target — holiday only ────────────────────────────────────────
     ax = axes[1]
-    dow = X_target_full.loc[idx, "hour_dow_target"]
     hol = X_target_full.loc[idx, "hour_holiday_target"]
 
-    ax.plot(idx, dow, color=gold, lw=0.9, label="hour_dow_target",     alpha=0.9)
-    ax.plot(idx, hol, color=red,  lw=0.9, label="hour_holiday_target", ls="--", alpha=0.85)
-    ax.fill_between(idx, dow, hol, where=(hol > dow),
-                    alpha=0.18, color=red,  label="holiday > dow")
-    ax.fill_between(idx, dow, hol, where=(hol < dow),
-                    alpha=0.18, color=gold, label="holiday < dow")
+    ax.plot(idx, hol, color=red, lw=0.9, label="hour_holiday_target", ls="--", alpha=0.85)
 
     holiday_idx = idx[X_full.loc[idx, "holiday"] == 1]
     for hd in holiday_idx[::24]:
@@ -1176,9 +1127,17 @@ def plot_holiday_encodings_over_time(
                    color=holiday_orange, alpha=0.07, zorder=0)
 
     ax.legend(fontsize=7, loc="upper right", framealpha=0.0, edgecolor="none", ncol=2)
-    _encoding_style(ax, "Target  (holiday vs. dow)", gold, ylabel="target value", xlabel="Date", rotate_x=45)
-    
+    _encoding_style(ax, "Target  (hour_holiday_target)", red, ylabel="target value", xlabel="Date", rotate_x=45)
 
+    _encoding_xaxis(axes, idx)
+
+    fig.suptitle(
+        f"Holiday encodings over time  ·  {sample_days}-day window",
+        fontsize=12, fontweight="bold", color="#28251d",
+    )
+    plt.savefig("holiday_encodings_over_time.png", dpi=150,
+                bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.show()
     return fig
 
 
