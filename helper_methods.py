@@ -317,6 +317,17 @@ def interactive_forecast_plot(
     """
     Interactive slider to browse forecast plots per day.
 
+    Performance
+    -----------
+    The figure, axes and all line artists are built **once**. Moving a slider
+    only updates the artists' data, so the expensive subplot creation, styling,
+    legend and layout work happens a single time instead of on every frame.
+    If ``ipympl`` is installed the interactive ("widget") backend is used and the
+    canvas is updated in place via ``fig.canvas.draw_idle()`` (no PNG re-render);
+    otherwise it falls back to re-rendering into a single ``Output`` widget on the
+    inline backend. Sliders use ``continuous_update=False`` so a redraw happens on
+    release, not per pixel.
+
     Usage (minimal):
         interactive_forecast_plot(models_dict)
 
@@ -331,20 +342,302 @@ def interactive_forecast_plot(
             context_hours=48,
         )
     """
-    num_days = len(next(iter(models_dict.values())))
+    from ipywidgets import Output, IntSlider, HBox, VBox
+    from IPython.display import display
 
-    interact(
-        plot_forecasts_for_day,
-        models_dict=fixed(models_dict),
-        day=IntSlider(min=1, max=num_days, step=1, value=1, description="Day"),
-        y=fixed(y),
-        X_full=fixed(X_full),
-        X_target_full=fixed(X_target_full),
-        X_cyclic_full=fixed(X_cyclic_full),
-        X_scaled_full=fixed(X_scaled_full),
-        context_hours=IntSlider(min=0, max=max_context_hours, step=24, value=context_hours,
-                                description="Context h"),
-    )
+    # ── Backend ────────────────────────────────────────────────────────────────
+    # Prefer the interactive ipympl ("widget") backend: it updates the existing
+    # canvas in place (fig.canvas.draw_idle) instead of re-rasterising a fresh PNG
+    # on every frame, which is much faster. Fall back to the inline backend (re-
+    # render into an Output widget) if ipympl is unavailable.
+    interactive_backend = False
+    try:
+        import ipympl  # noqa: F401
+        from IPython import get_ipython
+        _ip = get_ipython()
+        if _ip is not None:
+            _ip.run_line_magic("matplotlib", "widget")
+            interactive_backend = True
+    except Exception:
+        interactive_backend = False
+
+    # ── Colors ────────────────────────────────────────────────────────────────
+    teal = "#4f98a3"; gold = "#e8af34"; purple = "#a86fdf"; orange = "#ffbd67"
+    holiday_orange = "#fda500"; red = "#dd6974"; green = "#6daa45"
+    muted = "#5a5957"; bg = "#FFFFFF"
+
+    # ── Layout flags (constant across frames) ─────────────────────────────────
+    show_encodings = X_full is not None
+    show_y_panel   = y is not None
+    show_hour_raw    = show_encodings
+    show_hour_target = show_encodings and X_target_full is not None
+    show_hour_cyclic = show_encodings and X_cyclic_full is not None
+    show_hour_scaled = show_encodings and X_scaled_full is not None
+    show_hol_onehot  = show_encodings and "holiday" in X_full.columns
+    show_hol_target  = show_encodings and X_target_full is not None and \
+                       "hour_holiday_target" in X_target_full.columns
+    scaled_col = None
+    if show_hour_scaled:
+        scaled_col = next((c for c in X_scaled_full.columns
+                           if "hour" in c and c != "holiday"), None)
+        show_hour_scaled = scaled_col is not None
+
+    n_enc = sum([show_hour_raw, show_hour_target, show_hour_cyclic,
+                 show_hour_scaled, show_hol_onehot, show_hol_target])
+    n_rows  = 1 + (1 if show_y_panel else 0) + n_enc
+    heights = [3] + ([1] if show_y_panel else []) + [1] * n_enc
+
+    num_days = len(next(iter(models_dict.values())))
+    first_df = next(iter(models_dict.values()))
+
+    # ── Build the figure ONCE ─────────────────────────────────────────────────
+    _encoding_rcparams()
+    with plt.ioff():   # never auto-display; we place the figure/canvas manually
+        fig, axes = plt.subplots(
+            n_rows, 1,
+            figsize=(14, 3 + 1.6 * max(n_enc + (1 if show_y_panel else 0), 1)),
+            sharex=True,
+            gridspec_kw={"height_ratios": heights, "hspace": 0.12,
+                         "top": 0.94, "bottom": 0.08},
+        )
+    if n_rows == 1:
+        axes = [axes]
+    fig.patch.set_facecolor(bg)
+
+    ax_fc = axes[0]
+    ai = iter(axes[1:])
+
+    # forecast-start vlines (one per axis), updated via set_xdata
+    vlines = [ax.axvline(0, color="#d4d1ca", lw=1.0, ls="--", alpha=0.8)
+              for ax in axes]
+
+    # persistent line artists for the forecast panel (empty for now)
+    l_ctx  = ax_fc.plot([], [], color=muted, lw=1.0, alpha=0.5,
+                        label="context (true)")[0]
+    l_true = ax_fc.plot([], [], label="y (True)", lw=2.0, color="#28251d")[0]
+    l_models = {lbl: ax_fc.plot([], [], label=lbl, ls="--", lw=1.1)[0]
+                for lbl in models_dict}
+    ax_fc.set_ylabel("Value", fontsize=8, color="#797876")
+    ax_fc.grid(True, axis="y", alpha=0.4)
+    ax_fc.spines[["top", "right"]].set_visible(False)
+
+    state = {"fills": [], "spans": []}
+
+    if show_y_panel:
+        ax = next(ai); state["ax_y"] = ax
+        state["l_y"] = ax.plot([], [], color=muted, lw=0.9, alpha=0.85)[0]
+        _encoding_style(ax, "y  (true load)", muted, ylabel="load")
+    if show_hour_raw:
+        ax = next(ai); state["ax_raw"] = ax
+        state["l_raw"] = ax.plot([], [], color=green, lw=0.9,
+                                 drawstyle="steps-post")[0]
+        ax.set_ylim(-0.5, 24); ax.set_yticks([0, 6, 12, 18, 23])
+        _encoding_style(ax, "Raw  (hour_of_day)", green, ylabel="hour [0–23]")
+    if show_hour_target:
+        ax = next(ai); state["ax_tgt"] = ax
+        state["l_tgt"] = ax.plot([], [], color=gold, lw=0.9)[0]
+        _encoding_style(ax, "Target  (hour_dow)", gold, ylabel="target")
+    if show_hour_cyclic:
+        ax = next(ai); state["ax_cyc"] = ax
+        state["l_sin"] = ax.plot([], [], color=purple, lw=0.9, label="sin")[0]
+        state["l_cos"] = ax.plot([], [], color=teal, lw=0.9, label="cos",
+                                 ls="--", alpha=0.75)[0]
+        ax.axhline(0, color=muted, lw=0.4, alpha=0.5)
+        ax.set_ylim(-1.25, 1.25); ax.set_yticks([-1, 0, 1])
+        ax.legend(fontsize=7, loc="upper right", framealpha=0.0, edgecolor="none")
+        _encoding_style(ax, "Cyclic  (hour)", purple, ylabel="sin/cos")
+    if show_hour_scaled:
+        ax = next(ai); state["ax_scl"] = ax
+        state["l_scl"] = ax.plot([], [], color=orange, lw=0.9)[0]
+        ax.set_yticks([0, 0.5, 1])
+        _encoding_style(ax, f"Scaled  ({scaled_col})", orange, ylabel="[0–1]")
+    if show_hol_onehot:
+        ax = next(ai); state["ax_hol1"] = ax
+        state["l_hol1"] = ax.plot([], [], color=holiday_orange, lw=1.2,
+                                  drawstyle="steps-post")[0]
+        ax.set_ylim(-0.15, 1.4); ax.set_yticks([0, 1])
+        ax.set_yticklabels(["0", "1"], fontsize=8)
+        _encoding_style(ax, "One-Hot  (holiday)", holiday_orange, ylabel="holiday")
+    if show_hol_target:
+        ax = next(ai); state["ax_holt"] = ax
+        state["l_holt"] = ax.plot([], [], color=red, lw=0.9,
+                                  label="hour_holiday_target",
+                                  ls="--", alpha=0.85)[0]
+        _encoding_style(ax, "Target  (holiday vs. dow)", gold, ylabel="target")
+
+    # static bottom x-axis
+    axes[-1].spines["bottom"].set_visible(True)
+    axes[-1].spines["bottom"].set_color("#d4d1ca")
+    axes[-1].tick_params(axis="x", length=3)
+    axes[-1].set_xlabel("Timestamp", fontsize=9, color="#797876")
+    plt.setp(axes[-1].get_xticklabels(), rotation=45, ha="right", fontsize=8)
+    fig.subplots_adjust(top=0.94, bottom=0.08, hspace=0.12)
+    if not interactive_backend:
+        plt.close(fig)   # inline: detach from auto-display; we render manually
+
+    # ── helpers ────────────────────────────────────────────────────────────────
+    def _fill(ax, idx, vals, **kw):
+        state["fills"].append(ax.fill_between(idx, vals, **kw))
+
+    def _autoscale(ax, *arrays):
+        vals = [np.asarray(a, float).ravel() for a in arrays
+                if a is not None and len(a)]
+        if not vals:
+            return
+        v = np.concatenate(vals)
+        lo, hi = np.nanmin(v), np.nanmax(v)
+        pad = (hi - lo) * 0.05 or 0.5
+        ax.set_ylim(lo - pad, hi + pad)
+
+    # ── per-frame update ───────────────────────────────────────────────────────
+    def update():
+        day = day_slider.value
+        ch  = ctx_slider.value
+
+        for c in state["fills"]:
+            c.remove()
+        for s in state["spans"]:
+            s.remove()
+        state["fills"] = []; state["spans"] = []
+
+        row    = first_df.iloc[day - 1]
+        y_true = row["y_test"]
+        x      = y_true.index
+        x0     = x[0]
+        y_true_arr = np.asarray(y_true, float)
+
+        show_context = ch > 0
+        ctx_start = x0 - pd.Timedelta(hours=ch)
+        if show_context and y is not None:
+            ctx_y = y[(y.index >= ctx_start) & (y.index < x0)]
+            ctx_idx = ctx_y.index
+        elif show_context and X_full is not None:
+            ctx_idx = X_full.index[(X_full.index >= ctx_start) & (X_full.index < x0)]
+            ctx_y = None
+        else:
+            ctx_idx = pd.DatetimeIndex([]); ctx_y = None
+        enc_idx = ctx_idx.append(x) if len(ctx_idx) else x
+
+        # forecast-start vlines
+        vis = bool(show_context and len(ctx_idx))
+        for vl in vlines:
+            vl.set_xdata([x0, x0]); vl.set_visible(vis)
+
+        # holiday shading (vectorised contiguous spans, drawn on every axis)
+        if show_hol_onehot:
+            if X_full.loc[x, "holiday"].values.astype(bool).any():
+                for ax in axes:
+                    state["spans"].append(
+                        ax.axvspan(x[0], x[-1], color=holiday_orange,
+                                   alpha=0.06, zorder=0))
+            if show_context and len(ctx_idx):
+                ctx_hol = X_full.loc[ctx_idx, "holiday"].values.astype(bool)
+                if ctx_hol.any():
+                    edges = np.diff(np.concatenate(
+                        [[0], ctx_hol.astype(np.int8), [0]]))
+                    starts = np.where(edges == 1)[0]
+                    ends   = np.where(edges == -1)[0]
+                    for s_i, e_i in zip(starts, ends):
+                        t0 = ctx_idx[s_i]
+                        t1 = ctx_idx[e_i - 1] + pd.Timedelta(hours=1)
+                        for ax in axes:
+                            state["spans"].append(
+                                ax.axvspan(t0, t1, color=holiday_orange,
+                                           alpha=0.06, zorder=0))
+
+        # forecast panel
+        if show_context and ctx_y is not None and len(ctx_y):
+            ctx_arr = np.asarray(ctx_y, float)
+            l_ctx.set_data(ctx_y.index, ctx_arr); l_ctx.set_visible(True)
+        else:
+            ctx_arr = None
+            l_ctx.set_data([], []); l_ctx.set_visible(False)
+        l_true.set_data(x, y_true_arr)
+        scale_arrays = [y_true_arr, ctx_arr]
+        for lbl, ln in l_models.items():
+            yp = np.asarray(models_dict[lbl].iloc[day - 1]["y_pred"], float)
+            ln.set_data(x, yp); scale_arrays.append(yp)
+        _autoscale(ax_fc, *scale_arrays)
+
+        is_hol = show_hol_onehot and \
+            X_full.loc[x, "holiday"].values.astype(bool).any()
+        ax_fc.set_title(
+            f"Forecast Comparison – {x0.date()}" + (" is Holiday" if is_hol else ""),
+            fontsize=11, fontweight="bold", color="#28251d", loc="left")
+        # legend reflects currently visible handles
+        handles = ([l_ctx] if l_ctx.get_visible() else []) + \
+                  [l_true] + list(l_models.values())
+        ax_fc.legend(handles=handles, fontsize=7, framealpha=0.0, ncol=2)
+
+        # y panel
+        if show_y_panel:
+            ax = state["ax_y"]
+            y_enc = y[y.index.isin(enc_idx)] if y is not None else None
+            if y_enc is not None and len(y_enc):
+                ye = np.asarray(y_enc, float)
+                state["l_y"].set_data(y_enc.index, ye)
+                _fill(ax, y_enc.index, ye, alpha=0.10, color=muted)
+                _autoscale(ax, ye)
+            else:
+                state["l_y"].set_data([], [])
+
+        if show_hour_raw:
+            hv = X_full.loc[enc_idx, "hour_of_day"].values.astype(float)
+            state["l_raw"].set_data(enc_idx, hv)
+            _fill(state["ax_raw"], enc_idx, hv, step="post", color=green, alpha=0.12)
+        if show_hour_target:
+            tv = X_target_full.loc[enc_idx, "hour_dow_target"].values.astype(float)
+            state["l_tgt"].set_data(enc_idx, tv)
+            _fill(state["ax_tgt"], enc_idx, tv, alpha=0.10, color=gold)
+            _autoscale(state["ax_tgt"], tv)
+        if show_hour_cyclic:
+            sv = X_cyclic_full.loc[enc_idx, "hour_sin"].values.astype(float)
+            cv = X_cyclic_full.loc[enc_idx, "hour_cos"].values.astype(float)
+            state["l_sin"].set_data(enc_idx, sv)
+            state["l_cos"].set_data(enc_idx, cv)
+        if show_hour_scaled:
+            scv = X_scaled_full.loc[enc_idx, scaled_col].values.astype(float)
+            state["l_scl"].set_data(enc_idx, scv)
+            _fill(state["ax_scl"], enc_idx, scv, alpha=0.15, color=orange)
+            _autoscale(state["ax_scl"], scv)
+        if show_hol_onehot:
+            hf = X_full.loc[enc_idx, "holiday"].values.astype(float)
+            state["l_hol1"].set_data(enc_idx, hf)
+            _fill(state["ax_hol1"], enc_idx, hf, step="post",
+                  color=holiday_orange, alpha=0.45)
+        if show_hol_target:
+            hv = X_target_full.loc[enc_idx, "hour_holiday_target"].values.astype(float)
+            state["l_holt"].set_data(enc_idx, hv)
+            _autoscale(state["ax_holt"], hv)
+
+        # shared x-limits
+        ax_fc.set_xlim(enc_idx[0], enc_idx[-1])
+
+        if interactive_backend:
+            fig.canvas.draw_idle()       # in-place canvas update (fast, no re-raster)
+        else:
+            out.clear_output(wait=True)  # inline fallback: re-render the PNG
+            with out:
+                display(fig)
+
+    # ── widgets ────────────────────────────────────────────────────────────────
+    day_slider = IntSlider(min=1, max=num_days, step=1, value=1,
+                           description="Day", continuous_update=False)
+    ctx_slider = IntSlider(min=0, max=max_context_hours, step=24,
+                           value=context_hours, description="Context h",
+                           continuous_update=False)
+    out = None if interactive_backend else Output()
+    day_slider.observe(lambda _ch: update(), names="value")
+    ctx_slider.observe(lambda _ch: update(), names="value")
+
+    controls = HBox([day_slider, ctx_slider])
+    if interactive_backend:
+        fig.canvas.header_visible = False
+        fig.canvas.footer_visible = False
+        display(VBox([controls, fig.canvas]))
+    else:
+        display(VBox([controls, out]))
+    update()
 #
 #
 #
